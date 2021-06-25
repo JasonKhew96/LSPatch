@@ -89,6 +89,12 @@ public class LSPatch {
             "x86",
             "x86_64"
     ));
+    private static final HashSet<String> APKS_LIB_FILE_ARRAY = new HashSet<>(Arrays.asList(
+            "split_config.armeabi_v7a.apk",
+            "split_config.arm64_v8a.apk",
+            "split_config.x86.apk",
+            "split_config.x86_64"
+    ));
 
     private static JCommander jCommander;
 
@@ -123,12 +129,21 @@ public class LSPatch {
             var outputDir = new File(outputPath);
             outputDir.mkdirs();
 
-            File outputFile = new File(outputDir, String.format("%s-lv%s-xposed-signed.apk", FilenameUtils.getBaseName(apkFileName), sigbypassLevel)).getAbsoluteFile();
+            if (apkFileName.endsWith(".apk")) {
+                File outputFile = new File(outputDir, String.format("%s-lv%s-xposed-signed.apk", FilenameUtils.getBaseName(apkFileName), sigbypassLevel)).getAbsoluteFile();
 
-            if (outputFile.exists() && !forceOverwrite)
-                throw new PatchError(outputPath + " exists. Use --force to overwrite");
-            System.out.println("Processing " + srcApkFile + " -> " + outputFile);
-            patch(srcApkFile, outputFile);
+                if (outputFile.exists() && !forceOverwrite)
+                    throw new PatchError(outputPath + " exists. Use --force to overwrite");
+                System.out.println("Processing " + srcApkFile + " -> " + outputFile);
+                patch(srcApkFile, outputFile);
+            } else if (apkFileName.endsWith(".apks")) {
+                File outputFile = new File(outputDir, String.format("%s-lv%s-xposed-signed.apks", FilenameUtils.getBaseName(apkFileName), sigbypassLevel)).getAbsoluteFile();
+
+                if (outputFile.exists() && !forceOverwrite)
+                    throw new PatchError(outputPath + " exists. Use --force to overwrite");
+                System.out.println("Processing " + srcApkFile + " -> " + outputFile);
+                patchApks(srcApkFile, outputFile);
+            }
         }
     }
 
@@ -285,6 +300,203 @@ public class LSPatch {
             } catch (Throwable ignored) {
             }
         }
+    }
+
+    public void patchApks(File srcApksFile, File outputFile) throws PatchError, IOException {
+        if (!srcApksFile.exists())
+            throw new PatchError("The source apks file does not exit. Please provide a correct path.");
+
+        File tmpApksDir = Files.createTempDirectory(srcApksFile.getName()).toFile();
+
+        if (verbose)
+            System.out.println("apks path: " + srcApksFile);
+
+        System.out.println("Decompress apks...");
+
+        if (!org.lsposed.patch.util.FileUtils.decompressZip(srcApksFile.getPath(), tmpApksDir.getPath())) {
+            tmpApksDir.delete();
+            System.err.println("Decompress apks failed");
+        }
+
+        System.out.println("Parsing apks...");
+
+        try {
+            for (File file : tmpApksDir.listFiles()) {
+                if (!file.getName().endsWith(".apk")) {
+                    continue;
+                }
+
+                ZFile zFile = ZFile.openReadWrite(file);
+
+                // lib
+                for (String fn : APKS_LIB_FILE_ARRAY) {
+                    if (file.getName().equals(fn)) {
+                        System.out.println("Processing lib split apk");
+
+                        // copy so and dex files into the unzipped apk
+                        Set<String> apkArchs = new HashSet<>();
+
+                        if (verbose)
+                            System.out.println("Search target apk library arch..");
+                        for (StoredEntry storedEntry : zFile.entries()) {
+                            var name = storedEntry.getCentralDirectoryHeader().getName();
+                            if (name.startsWith("lib/") && name.length() >= 5) {
+                                var arch = name.substring(4, name.indexOf('/', 5));
+                                apkArchs.add(arch);
+                            }
+                        }
+
+                        if (apkArchs.isEmpty()) {
+                            apkArchs.addAll(APK_LIB_PATH_ARRAY);
+                        }
+
+                        apkArchs.removeIf((arch) -> {
+                            if (!APK_LIB_PATH_ARRAY.contains(arch) && !arch.equals("armeabi")) {
+                                System.err.println("Warning: unsupported arch " + arch + ". Skipping...");
+                                return true;
+                            }
+                            return false;
+                        });
+                        if (verbose)
+                            System.out.println("Adding native lib..");
+
+                        for (String arch : apkArchs) {
+                            // lib/armeabi-v7a -> armeabi-v7a
+                            String entryName = "lib/" + arch + "/liblspd.so";
+                            try (var is = getClass().getClassLoader().getResourceAsStream("assets/so/" + (arch.equals("armeabi") ? "armeabi-v7a" : arch) + "/liblspd.so")) {
+                                zFile.add(entryName, is, false); // no compress for so
+                            } catch (Throwable e) {
+                                throw new PatchError("Error when adding native lib: " + e);
+                            }
+                            if (verbose)
+                                System.out.println("added " + entryName);
+                        }
+                    }
+                }
+
+                // base.apk
+                if (file.getName().equals("base.apk")) {
+                    System.out.println("Processing base split apk");
+
+                    String backupApk = file.getParent() + File.pathSeparator + "base_backup.apk";
+                    if (sigbypassLevel >= Constants.SIGBYPASS_LV_PM_OPENAT) {
+                        FileUtils.copyFile(file, new File(backupApk));
+                    }
+
+                    if (sigbypassLevel > 0) {
+                        // save the apk original signature info, to support crack signature.
+                        String originalSignature = ApkSignatureHelper.getApkSignInfo(file.getAbsolutePath());
+                        if (originalSignature == null || originalSignature.isEmpty()) {
+                            throw new PatchError("get original signature failed");
+                        }
+                        if (verbose)
+                            System.out.println("Original signature\n" + originalSignature);
+                        try (var is = new ByteArrayInputStream(originalSignature.getBytes(StandardCharsets.UTF_8))) {
+                            zFile.add(SIGNATURE_INFO_ASSET_PATH, is);
+                        } catch (Throwable e) {
+                            throw new PatchError("Error when saving signature: " + e);
+                        }
+                    }
+
+                    // get the dex count in the apk zip file
+                    dexFileCount = findDexFileCount(zFile);
+
+                    if (verbose)
+                        System.out.println("dexFileCount: " + dexFileCount);
+
+                    // copy out manifest file from zlib
+                    var manifestEntry = zFile.get(ANDROID_MANIFEST_XML);
+                    if (manifestEntry == null)
+                        throw new PatchError("Provided file is not a valid apk");
+
+                    // parse the app main application full name from the manifest file
+                    ManifestParser.Pair pair = ManifestParser.parseManifestFile(manifestEntry.open());
+                    if (pair == null)
+                        throw new PatchError("Failed to parse AndroidManifest.xml");
+                    String applicationName = pair.applicationName == null ? "" : pair.applicationName;
+
+                    if (verbose)
+                        System.out.println("original application name: " + applicationName);
+
+                    System.out.println("Patching apk...");
+                    // modify manifest
+                    try (var is = new ByteArrayInputStream(modifyManifestFile(manifestEntry.open()))) {
+                        zFile.add(ANDROID_MANIFEST_XML, is);
+                    } catch (Throwable e) {
+                        throw new PatchError("Error when modifying manifest: " + e);
+                    }
+
+                    // save original main application name to asset file even its empty
+                    try (var is = new ByteArrayInputStream(applicationName.getBytes(StandardCharsets.UTF_8))) {
+                        zFile.add(APPLICATION_NAME_ASSET_PATH, is);
+                    } catch (Throwable e) {
+                        throw new PatchError("Error when saving application name: " + e);
+                    }
+
+                    if (verbose)
+                        System.out.println("Adding dex..");
+
+                    try (var is = getClass().getClassLoader().getResourceAsStream("assets/dex/loader.dex")) {
+                        String copiedDexFileName = "classes" + (dexFileCount + 1) + ".dex";
+                        zFile.add(copiedDexFileName, is);
+                        dexFileCount++;
+                    } catch (Throwable e) {
+                        throw new PatchError("Error when add dex: " + e);
+                    }
+
+                    // copy origin apk to assets
+                    // convenient to bypass some check like CRC
+                    if (sigbypassLevel >= Constants.SIGBYPASS_LV_PM_OPENAT) {
+                        zFile.add(ORIGIN_APK_ASSET_PATH, new FileInputStream(backupApk));
+                        new File(backupApk).delete();
+                    }
+
+                    try (var is = getClass().getClassLoader().getResourceAsStream("assets/dex/lsp.dex")) {
+                        zFile.add("assets/lsp", is);
+                    } catch (Throwable e) {
+                        throw new PatchError("Error when add assets: " + e);
+                    }
+
+                    // save lspatch config to asset..
+                    try (var is = new ByteArrayInputStream("42".getBytes(StandardCharsets.UTF_8))) {
+                        zFile.add("assets/" + Constants.CONFIG_NAME_SIGBYPASSLV + sigbypassLevel, is);
+                    } catch (Throwable e) {
+                        throw new PatchError("Error when saving signature bypass level: " + e);
+                    }
+                    embedModules(zFile);
+                }
+
+                System.out.println("Signing apk...");
+                var sign = zFile.get("META-INF/MANIFEST.MF");
+                if (sign != null) {
+                    System.out.println("Deleting META-INF/MANIFEST.MF");
+                    sign.delete();
+                }
+
+                zFile.update();
+
+                String tmpFilePath = file.getParent() + File.pathSeparator + "tmp.apk";
+                File tmpFile = new File(tmpFilePath);
+                signApkUsingAndroidApksigner(file, tmpFile);
+                org.lsposed.patch.util.FileUtils.copyFile(tmpFile, file);
+                tmpFile.delete();
+
+                System.out.println("Done. Output APK: " + file.getAbsolutePath());
+
+            }
+
+            org.lsposed.patch.util.FileUtils.compressToZip(tmpApksDir.getAbsolutePath(), outputFile.getAbsolutePath());
+
+            System.out.println("Done. Output APKs: " + outputFile.getAbsolutePath());
+        } catch (Throwable t) {
+            System.err.println(t);
+        } finally {
+            try {
+                tmpApksDir.delete();
+            } catch (Throwable ignored) {
+            }
+        }
+
     }
 
     private void embedModules(ZFile zFile) {
